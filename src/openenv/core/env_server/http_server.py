@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 import time
 import uuid
@@ -73,6 +74,10 @@ from .mcp_types import (
     WSMCPResponse,
 )
 from .mcp_environment import get_server_tools
+
+logger = logging.getLogger(__name__)
+
+_SESSION_REAPER_INTERVAL_SECONDS = 30
 
 
 def _make_json_serializable(obj: Any) -> Any:
@@ -215,6 +220,9 @@ class HTTPEnvServer:
         # Create thread pool for running sync code in async context
         # This is needed for environments using sync libraries (e.g., Playwright)
         self._executor = ThreadPoolExecutor(max_workers=32)
+
+        # Background reaper task for expired sessions (started on first register_routes call)
+        self._reaper_task: Optional[asyncio.Task] = None
 
     def _validate_concurrency_safety(self) -> None:
         """
@@ -398,6 +406,66 @@ class HTTPEnvServer:
         """
         return self._session_info.get(session_id)
 
+    def _start_session_reaper(self) -> None:
+        """
+        Start the background session reaper task if a session_timeout is configured.
+
+        The reaper periodically checks for sessions that have been idle longer than
+        the configured timeout and destroys them. This prevents leaked sessions from
+        permanently consuming capacity when WebSocket clients disconnect uncleanly.
+        """
+        if self._concurrency_config.session_timeout is None:
+            return
+        if self._reaper_task is not None:
+            return  # Already started
+
+        self._reaper_task = asyncio.create_task(self._session_reaper_loop())
+
+    async def _session_reaper_loop(self) -> None:
+        """Background loop that reaps expired sessions."""
+        timeout = self._concurrency_config.session_timeout
+        while True:
+            try:
+                await asyncio.sleep(_SESSION_REAPER_INTERVAL_SECONDS)
+
+                now = time.time()
+                expired_session_ids: list[str] = []
+
+                # Snapshot session info under lock to find expired sessions
+                async with self._session_lock:
+                    for session_id, info in self._session_info.items():
+                        idle_seconds = now - info.last_activity_at
+                        if idle_seconds > timeout:
+                            expired_session_ids.append(session_id)
+
+                # Destroy expired sessions outside the lock to avoid deadlock
+                for session_id in expired_session_ids:
+                    info = self._session_info.get(session_id)
+                    if info is None:
+                        # Already destroyed by another path (e.g., clean disconnect)
+                        continue
+                    idle_seconds = now - info.last_activity_at
+                    # Re-check staleness: activity may have occurred since snapshot
+                    if idle_seconds <= timeout:
+                        continue
+                    logger.warning(
+                        "Reaping idle session %s (idle %.0fs, timeout %.0fs)",
+                        session_id,
+                        idle_seconds,
+                        timeout,
+                    )
+                    try:
+                        await self._destroy_session(session_id)
+                    except Exception:
+                        logger.exception(
+                            "Error reaping session %s", session_id
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Unexpected error in session reaper loop")
+
     async def _run_in_session_executor(
         self, session_id: str, func: Callable[..., Observation], *args, **kwargs
     ) -> Observation:
@@ -451,6 +519,11 @@ class HTTPEnvServer:
         Raises:
             ValueError: If mode is not a valid ServerMode or string equivalent.
         """
+        # Start session reaper on app startup (requires running event loop)
+        @app.on_event("startup")
+        async def _start_reaper():
+            self._start_session_reaper()
+
         # Convert string to ServerMode enum for backwards compatibility
         if isinstance(mode, str):
             try:
