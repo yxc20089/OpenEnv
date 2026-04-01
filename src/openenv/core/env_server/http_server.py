@@ -348,6 +348,11 @@ class HTTPEnvServer:
         """
         Destroy a WebSocket session and cleanup resources.
 
+        The session is removed from the capacity-tracking dict FIRST (under
+        lock) so that the slot is freed even if env.close() hangs or the
+        asyncio task is cancelled.  env.close() is then run best-effort with
+        a timeout to prevent indefinite blocking.
+
         Args:
             session_id: The session ID to destroy
         """
@@ -356,15 +361,26 @@ class HTTPEnvServer:
             executor = self._session_executors.pop(session_id, None)
             self._session_info.pop(session_id, None)
 
-        # Run close() in the same executor where the env was created
-        # This is required for thread-sensitive libraries like Playwright/greenlet
+        # Run close() in the same executor where the env was created.
+        # Use asyncio.wait_for to bound the wait time — if the environment's
+        # close() hangs (e.g., blocked gRPC call), we give up after 30s.
+        # Also catch BaseException (not just Exception) so that
+        # asyncio.CancelledError doesn't skip the fallback close attempt.
         if env is not None:
             if executor is not None:
                 try:
                     loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(executor, env.close)
-                except Exception:
-                    # If executor close fails, try direct close as fallback
+                    await asyncio.wait_for(
+                        loop.run_in_executor(executor, env.close),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "env.close() timed out for session %s", session_id
+                    )
+                except BaseException:
+                    # Catches CancelledError + Exception.  Try direct close
+                    # as last resort (runs synchronously in current thread).
                     try:
                         env.close()
                     except Exception:
@@ -777,7 +793,10 @@ class HTTPEnvServer:
                 await websocket.send_text(error_resp.model_dump_json())
             finally:
                 if session_id:
-                    await self._destroy_session(session_id)
+                    try:
+                        await asyncio.shield(self._destroy_session(session_id))
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 try:
                     await websocket.close()
                 except RuntimeError:
@@ -1300,7 +1319,15 @@ all schema information needed to interact with the environment.
                 await websocket.send_text(error_resp.model_dump_json())
             finally:
                 if session_id:
-                    await self._destroy_session(session_id)
+                    try:
+                        # Shield from cancellation so the session is always
+                        # cleaned up even when uvicorn cancels the task on
+                        # abrupt WebSocket disconnect (CancelledError).
+                        await asyncio.shield(self._destroy_session(session_id))
+                    except (asyncio.CancelledError, Exception):
+                        # _destroy_session pops the session from _sessions
+                        # first, so capacity is freed even if close() fails.
+                        pass
                 try:
                     await websocket.close()
                 except RuntimeError:
@@ -1464,4 +1491,9 @@ HTTP API for interacting with OpenEnv environments through a standardized interf
         concurrency_config=concurrency_config,
     )
     server.register_routes(app)
+
+    # Store server reference on the app so custom endpoints (e.g., /clear-sessions)
+    # can access session management.
+    app.state.env_server = server
+
     return app
